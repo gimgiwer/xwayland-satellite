@@ -374,7 +374,7 @@ impl EarlyTestFixture {
         });
 
         let (fake_client, xwls_server) = UnixStream::pair().unwrap();
-        let satellite = ServerState::new(display.handle(), Some(client_s), xwls_server);
+        let satellite = ServerState::new(display.handle(), Some(client_s), xwls_server, false);
         let testwl = thread.join().unwrap();
 
         let xwls_connection = Connection::from_socket(fake_client).unwrap();
@@ -741,7 +741,7 @@ impl TestFixture<FakeXConnection> {
             assert!(surface_data.buffer.is_some());
         }
 
-        let scale = self.satellite.current_scale;
+        let scale = self.satellite.global_scale;
         let expected_width = (100.0 * scale) as u16;
         let expected_height = (100.0 * scale) as u16;
 

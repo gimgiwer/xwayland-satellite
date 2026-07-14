@@ -97,6 +97,9 @@ for more information on how to set this variable.
 \fBWAYLAND_DISPLAY\fR
 Name of the Wayland server's display.
 .TP
+\fBXWAYLAND_SATELLITE_COMPOSITOR_SCALING\fR
+If set, enables compositor-side scaling.
+.TP
 \fBXDG_RUNTIME_DIR\fR
 The directory used by \fBxwayland\-satellite\fR to both look for the Wayland socket to connect to and to create the Wayland socket \fBXwayland\fR will connect to.
 .SH BUGS
