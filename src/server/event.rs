@@ -356,27 +356,42 @@ impl SurfaceEvents {
         drop(xdg);
 
         if let Some(pending) = pending {
+            let is_popup = matches!(
+                data.get::<&SurfaceRole>().as_deref(),
+                Some(SurfaceRole::Popup(_))
+            );
             let mut query = data.query::<(&SurfaceScaleFactor, &x::Window, &mut WindowData)>();
             let (scale_factor, window, window_data) = query.get().unwrap();
 
             let window = *window;
-            let x = (pending.x.max(0) as f64 * scale_factor.0) as i32 + window_data.output_offset.x;
-            let y = (pending.y.max(0) as f64 * scale_factor.0) as i32 + window_data.output_offset.y;
-            let width = if pending.width > 0 {
-                (pending.width as f64 * scale_factor.0) as u16
+            let (x, y, width, height) = if is_popup {
+                (
+                    window_data.attrs.dims.x as i32,
+                    window_data.attrs.dims.y as i32,
+                    window_data.attrs.dims.width,
+                    window_data.attrs.dims.height,
+                )
             } else {
-                window_data.attrs.dims.width
-            };
-            let height = if pending.height > 0 {
-                (pending.height as f64 * scale_factor.0) as u16
-            } else {
-                window_data.attrs.dims.height
+                let x = (pending.x.max(0) as f64 * scale_factor.0).round() as i32
+                    + window_data.output_offset.x;
+                let y = (pending.y.max(0) as f64 * scale_factor.0).round() as i32
+                    + window_data.output_offset.y;
+                let width = if pending.width > 0 {
+                    (pending.width as f64 * scale_factor.0).round() as u16
+                } else {
+                    window_data.attrs.dims.width
+                };
+                let height = if pending.height > 0 {
+                    (pending.height as f64 * scale_factor.0).round() as u16
+                } else {
+                    window_data.attrs.dims.height
+                };
+                (x, y, width, height)
             };
             debug!(
                 "configuring {} ({window:?}): {x}x{y}, {width}x{height}",
                 data.get::<&WlSurface>().unwrap().id(),
             );
-
 
             window_data.attrs.dims = WindowDims {
                 x: x as i16,
@@ -449,6 +464,16 @@ impl SurfaceEvents {
                             decorations.handle_fullscreen(toplevel.fullscreen);
                         }
                     }
+
+                    let prev_max = toplevel.maximized;
+                    toplevel.maximized =
+                        states.contains(&(u32::from(xdg_toplevel::State::Maximized) as u8));
+                    if toplevel.maximized != prev_max {
+                        state.connection.set_maximized(
+                            *data.get::<&x::Window>().unwrap(),
+                            toplevel.maximized,
+                        );
+                    }
                 };
 
                 role.xdg_mut().unwrap().pending = Some(PendingSurfaceState {
@@ -498,7 +523,11 @@ impl SurfaceEvents {
 
                 if first_configure {
                     let window_data = data.get::<&WindowData>().unwrap();
-                    if window_data.attrs.require_wm_focus() {
+                    // Do not auto-focus popups that are menus.
+                    // Popup menus rely on X11 pointer grabs and expect toplevel focus to be
+                    // maintained; sending SetInputFocus steals focus from the parent, causing
+                    // Chromium/Steam CEF to receive FocusOut and immediately cancel the menu.
+                    if window_data.attrs.require_wm_focus() && !window_data.attrs.is_menu {
                         let window = *data.get::<&x::Window>().unwrap();
                         state.inner.to_focus = Some(FocusData {
                             window,
@@ -510,9 +539,9 @@ impl SurfaceEvents {
             }
             xdg_popup::Event::Repositioned { .. } => {}
             xdg_popup::Event::PopupDone => {
-                state
-                    .connection
-                    .unmap_window(*data.get::<&x::Window>().unwrap());
+                let window = *data.get::<&x::Window>().unwrap();
+                debug!("xdg_popup::PopupDone received for {window:?}");
+                state.connection.unmap_window(window);
             }
             other => todo!("{other:?}"),
         }
@@ -533,7 +562,7 @@ pub(super) fn update_surface_viewport(
     let dims = &window_data.attrs.dims;
     let size_hints = &window_data.attrs.size_hints;
 
-    let width = (dims.width as f64 / scale_factor.0).ceil() as i32;
+    let width = (dims.width as f64 / scale_factor.0).round() as i32;
     let mut height = dims.height;
     if let Some(SurfaceRole::Toplevel(Some(toplevel))) = role {
         if let Some(d) = &toplevel.decoration.satellite {
@@ -546,7 +575,7 @@ pub(super) fn update_surface_viewport(
             }
         }
     }
-    let height = (height as f64 / scale_factor.0).ceil() as i32;
+    let height = (height as f64 / scale_factor.0).round() as i32;
     if width > 0 && height > 0 {
         viewport.set_destination(width, height);
     }
@@ -1726,6 +1755,7 @@ impl OutputEvent {
                 width,
                 height,
                 refresh,
+            } => {
                 let comp_scaling = state.compositor_scaling;
                 let mut should_update_scale = false;
                 let mut scale_to_update = 0.0;
