@@ -11,6 +11,7 @@ struct RealData {
     display: Option<String>,
     listenfds: Vec<OwnedFd>,
     flags: Vec<String>,
+    compositor_scaling: bool,
 }
 impl xwayland_satellite::RunData for RealData {
     fn display(&self) -> Option<&str> {
@@ -23,6 +24,10 @@ impl xwayland_satellite::RunData for RealData {
 
     fn flags(&self) -> &[String] {
         &self.flags
+    }
+
+    fn compositor_scaling(&self) -> bool {
+        self.compositor_scaling
     }
 }
 
@@ -95,12 +100,11 @@ fn parse_args() -> RealData {
     let mut args = std::env::args().skip(1).peekable();
 
     // The first argument (other than the skipped-over binary name) is optionally the display name.
-    let Some(arg) = args.peek() else {
-        return data;
-    };
-    if arg.starts_with(':') {
-        data.display = Some(arg.to_owned());
-        args.next();
+    if let Some(arg) = args.peek() {
+        if arg.starts_with(':') {
+            data.display = Some(arg.to_owned());
+            args.next();
+        }
     }
 
     // All other options (including the first if it was not a display name) are supported flags
@@ -240,9 +244,18 @@ fn parse_args() -> RealData {
             }
         }
     }
+    let disable_env = std::env::var("XWAYLAND_SATELLITE_DISABLE_COMPOSITOR_SCALING").ok();
+    data.compositor_scaling = is_compositor_scaling_enabled(disable_env.as_deref());
     data.flags = flags.to_vec();
 
     data
+}
+
+fn is_compositor_scaling_enabled(disable_env: Option<&str>) -> bool {
+    let disabled = disable_env
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    !disabled
 }
 
 fn init_logger(integrated: bool) {
@@ -273,4 +286,24 @@ fn init_logger(integrated: bool) {
         .filter_level(log::LevelFilter::Info)
         .parse_default_env()
         .init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_compositor_scaling_enabled_by_default() {
+        assert!(is_compositor_scaling_enabled(None));
+        assert!(is_compositor_scaling_enabled(Some("")));
+        assert!(is_compositor_scaling_enabled(Some("0")));
+        assert!(is_compositor_scaling_enabled(Some("false")));
+    }
+
+    #[test]
+    fn test_compositor_scaling_disabled_via_env() {
+        assert!(!is_compositor_scaling_enabled(Some("1")));
+        assert!(!is_compositor_scaling_enabled(Some("true")));
+        assert!(!is_compositor_scaling_enabled(Some("TRUE")));
+    }
 }

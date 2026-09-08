@@ -40,6 +40,9 @@ pub trait RunData {
     fn flags(&self) -> &[String] {
         &[]
     }
+    fn compositor_scaling(&self) -> bool {
+        false
+    }
     fn server(&self) -> Option<UnixStream> {
         None
     }
@@ -156,7 +159,8 @@ pub fn main(mut data: impl RunData) -> Option<()> {
         }
     };
 
-    let mut server_state = EarlyServerState::new(dh, data.server(), connection);
+    let mut server_state =
+        EarlyServerState::new(dh, data.server(), connection, data.compositor_scaling());
     server_state.run();
 
     // Remove the lifetimes on our fds to avoid borrowing issues, since we know they will exist for

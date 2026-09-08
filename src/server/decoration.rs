@@ -21,18 +21,18 @@ use wayland_protocols::xdg::shell::client::xdg_toplevel::XdgToplevel;
 use xcb::x;
 
 #[derive(Debug)]
-pub struct DecorationsData {
-    pub wl: Option<ZxdgToplevelDecorationV1>,
+pub(super) struct DecorationsData {
+    pub(super) wl: Option<ZxdgToplevelDecorationV1>,
     // Boxed to avoid making ToplevelData so much bigger than PopupData
-    pub satellite: Option<Box<DecorationsDataSatellite>>,
+    pub(super) satellite: Option<Box<DecorationsDataSatellite>>,
 }
 
-pub struct DecorationMarker {
-    pub parent: Entity,
+pub(super) struct DecorationMarker {
+    pub(super) parent: Entity,
 }
 
 #[derive(Debug)]
-pub struct DecorationsDataSatellite {
+pub(super) struct DecorationsDataSatellite {
     surface: WlSurface,
     subsurface: WlSubsurface,
     pool: Entity,
@@ -55,9 +55,17 @@ impl Drop for DecorationsDataSatellite {
 }
 
 impl DecorationsDataSatellite {
-    pub const TITLEBAR_HEIGHT: i32 = 25;
+    const TITLEBAR_HEIGHT: i32 = 25;
 
-    pub fn try_new(
+    pub(super) fn calculate_titlebar_height() -> i32 {
+        Self::TITLEBAR_HEIGHT
+    }
+
+    pub(super) fn titlebar_height(&self) -> i32 {
+        Self::TITLEBAR_HEIGHT
+    }
+
+    pub(super) fn try_new(
         state: &InnerServerState<impl X11Selection>,
         parent: &WlSurface,
         title: Option<&str>,
@@ -88,7 +96,8 @@ impl DecorationsDataSatellite {
                 .subcompositor
                 .get_subsurface(&surface, parent, &state.qh, ())
         };
-        subsurface.set_position(0, -Self::TITLEBAR_HEIGHT);
+        let start_height = Self::calculate_titlebar_height();
+        subsurface.set_position(0, -start_height);
         let viewport = state.viewporter.get_viewport(&surface, &state.qh, ());
 
         Some((
@@ -139,11 +148,11 @@ impl DecorationsDataSatellite {
     }
 
     #[must_use]
-    pub fn will_draw_decorations(&self, width: i32) -> bool {
+    pub(super) fn will_draw_decorations(&self, width: i32) -> bool {
         width > 0 && self.should_draw
     }
 
-    pub fn draw_decorations(&mut self, world: &World, width: i32, parent_scale_factor: f32) {
+    pub(super) fn draw_decorations(&mut self, world: &World, width: i32, parent_scale_factor: f32) {
         if !self.will_draw_decorations(width) {
             if self.remove_buffer {
                 self.surface.attach(None, 0, 0);
@@ -155,7 +164,7 @@ impl DecorationsDataSatellite {
 
         self.scale = parent_scale_factor;
         let mut drawn_width = (width as f32 * self.scale).ceil() as i32;
-        let drawn_height = (Self::TITLEBAR_HEIGHT as f32 * self.scale).ceil() as i32;
+        let drawn_height = (self.titlebar_height() as f32 * self.scale).ceil() as i32;
 
         let x = x_pixmap(drawn_height as u32, self.scale, self.x_data.hovered);
         if x.width() > drawn_width as u32 {
@@ -198,17 +207,18 @@ impl DecorationsDataSatellite {
         );
         self.x_data = DecorationsBox {
             rect: Rect::from_ltrb(
-                width as f32 - Self::TITLEBAR_HEIGHT as f32,
+                width as f32 - self.titlebar_height() as f32,
                 0.0,
                 width as f32,
-                Self::TITLEBAR_HEIGHT as f32,
+                self.titlebar_height() as f32,
             )
             .unwrap(),
             hovered: false,
         };
 
         self.pixmap = bar;
-        self.viewport.set_destination(width, Self::TITLEBAR_HEIGHT);
+        let bar_h = self.titlebar_height();
+        self.viewport.set_destination(width, bar_h);
         self.update_buffer(world);
     }
 
@@ -233,7 +243,7 @@ impl DecorationsDataSatellite {
         self.update_buffer(world);
     }
 
-    pub fn set_title(&mut self, world: &World, title: &str) {
+    pub(super) fn set_title(&mut self, world: &World, title: &str) {
         self.title = Some(title.to_string());
         if !self.should_draw {
             return;
@@ -280,7 +290,7 @@ impl DecorationsDataSatellite {
         self.update_buffer(world);
     }
 
-    pub fn handle_fullscreen(&mut self, fullscreen: bool) {
+    pub(super) fn handle_fullscreen(&mut self, fullscreen: bool) {
         if self.should_draw == fullscreen {
             self.should_draw = !fullscreen;
             self.remove_buffer = fullscreen;
@@ -475,13 +485,13 @@ fn get_decoration(
     }))
 }
 
-pub fn handle_pointer_leave(state: &InnerServerState<impl X11Selection>, parent: Entity) {
+pub(super) fn handle_pointer_leave(state: &InnerServerState<impl X11Selection>, parent: Entity) {
     if let Some(mut decoration) = get_decoration(&state.world, parent) {
         decoration.handle_leave(&state.world);
     }
 }
 
-pub fn handle_pointer_motion(
+pub(super) fn handle_pointer_motion(
     state: &InnerServerState<impl X11Selection>,
     parent: Entity,
     surface_x: f64,
@@ -492,7 +502,7 @@ pub fn handle_pointer_motion(
     }
 }
 
-pub fn handle_pointer_click(
+pub(super) fn handle_pointer_click(
     state: &mut ServerState<impl XConnection>,
     parent: Entity,
     seat: &WlSeat,

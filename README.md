@@ -86,8 +86,9 @@ Some Java applications may present themselves as a blank screen by default with 
 `_JAVA_AWT_WM_NONREPARENTING=1` before launching it to fix this. Although `satellite` cannot automatically do this, you can configure Java to do this by adding `set _JAVA_AWT_WM_NONREPARENTING=1` to `/etc/profile.d/jre.sh`.
 
 ### Scaling/HiDPI
-For most GTK and Qt apps, xwayland-satellite should automatically scale them properly. Note that for mixed DPI monitor setups, satellite will choose
-the smallest monitor's DPI, meaning apps may have small text on other monitors.
+For most GTK and Qt apps, xwayland-satellite should automatically scale them properly.
+
+Compositor-side scaling is enabled by default. Satellite renders X11 windows at the highest display scale and maps them across outputs, letting the Wayland compositor downscale to lower-DPI monitors. To disable compositor-side scaling, set `XWAYLAND_SATELLITE_DISABLE_COMPOSITOR_SCALING=1`. To override the base scale factor, set `XWAYLAND_SATELLITE_BASE_SCALE` (1.0–8.0); for example, `1.0` preserves unscaled geometry to reduce VRAM usage on mixed-DPI setups.
 
 Other miscellaneous apps (such as Wine apps) may have small text on HiDPI displays. It is application dependent on getting apps to scale properly with satellite,
 so you will have to figure out what app specific config needs to be set. See [the Arch Wiki on HiDPI](https://wiki.archlinux.org/title/HiDPI) for a good place start.

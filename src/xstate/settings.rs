@@ -176,7 +176,7 @@ impl Settings {
         self.settings
             .entry(GDK_UNSCALED_DPI)
             .insert_entry(IntSetting {
-                value: setting.value / scale as i32,
+                value: setting.value / (scale as i32).max(1),
                 last_change_serial: self.serial,
             });
         self.settings
