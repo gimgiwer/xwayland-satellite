@@ -365,31 +365,42 @@ impl SurfaceEvents {
             let (scale_factor, window, window_data, role) = query.get().unwrap();
 
             let window = *window;
-            let x = (pending.x as f64 * scale_factor.0).round() as i32
-                + window_data.output_offset.x;
-            let y = (pending.y as f64 * scale_factor.0).round() as i32
-                + window_data.output_offset.y;
-            let width = if pending.width > 0 {
-                ((pending.width as f64 * scale_factor.0) as u32)
-                    .clamp(1, u16::MAX as u32) as u16
+            let is_popup = matches!(role, SurfaceRole::Popup(_));
+            let (x, y, width, height) = if is_popup {
+                (
+                    window_data.attrs.dims.x as i32,
+                    window_data.attrs.dims.y as i32,
+                    window_data.attrs.dims.width,
+                    window_data.attrs.dims.height,
+                )
             } else {
-                window_data.attrs.dims.width
-            };
-            let height = if pending.height > 0 {
-                let mut logical_height = pending.height;
-                if let SurfaceRole::Toplevel(Some(toplevel)) = role {
-                    if let Some(d) = &toplevel.decoration.satellite {
-                        let surface_width = (width as f64 / scale_factor.0).ceil() as i32;
-                        if d.will_draw_decorations(surface_width) {
-                            let bar_h = d.titlebar_height();
-                            logical_height = (logical_height - bar_h).max(bar_h);
+                let x = (pending.x as f64 * scale_factor.0).round() as i32
+                    + window_data.output_offset.x;
+                let y = (pending.y as f64 * scale_factor.0).round() as i32
+                    + window_data.output_offset.y;
+                let width = if pending.width > 0 {
+                    ((pending.width as f64 * scale_factor.0) as u32)
+                        .clamp(1, u16::MAX as u32) as u16
+                } else {
+                    window_data.attrs.dims.width
+                };
+                let height = if pending.height > 0 {
+                    let mut logical_height = pending.height;
+                    if let SurfaceRole::Toplevel(Some(toplevel)) = role {
+                        if let Some(d) = &toplevel.decoration.satellite {
+                            let surface_width = (width as f64 / scale_factor.0).ceil() as i32;
+                            if d.will_draw_decorations(surface_width) {
+                                let bar_h = d.titlebar_height();
+                                logical_height = (logical_height - bar_h).max(bar_h);
+                            }
                         }
                     }
-                }
-                ((logical_height as f64 * scale_factor.0) as u32)
-                    .clamp(1, u16::MAX as u32) as u16
-            } else {
-                window_data.attrs.dims.height
+                    ((logical_height as f64 * scale_factor.0) as u32)
+                        .clamp(1, u16::MAX as u32) as u16
+                } else {
+                    window_data.attrs.dims.height
+                };
+                (x, y, width, height)
             };
             debug!(
                 "configuring {} ({window:?}): {x}x{y}, {width}x{height}",
@@ -467,6 +478,16 @@ impl SurfaceEvents {
                             decorations.handle_fullscreen(toplevel.fullscreen);
                         }
                     }
+
+                    let prev_max = toplevel.maximized;
+                    toplevel.maximized =
+                        states.contains(&(u32::from(xdg_toplevel::State::Maximized) as u8));
+                    if toplevel.maximized != prev_max {
+                        state.connection.set_maximized(
+                            *data.get::<&x::Window>().unwrap(),
+                            toplevel.maximized,
+                        );
+                    }
                 };
 
                 role.xdg_mut().unwrap().pending = Some(PendingSurfaceState {
@@ -516,7 +537,11 @@ impl SurfaceEvents {
 
                 if first_configure {
                     let window_data = data.get::<&WindowData>().unwrap();
-                    if window_data.attrs.require_wm_focus() {
+                    // Do not auto-focus popups that are menus.
+                    // Popup menus rely on X11 pointer grabs and expect toplevel focus to be
+                    // maintained; sending SetInputFocus steals focus from the parent, causing
+                    // Chromium/Steam CEF to receive FocusOut and immediately cancel the menu.
+                    if window_data.attrs.require_wm_focus() && !window_data.attrs.is_menu {
                         let window = *data.get::<&x::Window>().unwrap();
                         state.inner.to_focus = Some(FocusData {
                             window,
@@ -529,9 +554,9 @@ impl SurfaceEvents {
             }
             xdg_popup::Event::Repositioned { .. } => {}
             xdg_popup::Event::PopupDone => {
-                state
-                    .connection
-                    .unmap_window(*data.get::<&x::Window>().unwrap());
+                let window = *data.get::<&x::Window>().unwrap();
+                debug!("xdg_popup::PopupDone received for {window:?}");
+                state.connection.unmap_window(window);
             }
             other => todo!("{other:?}"),
         }

@@ -103,8 +103,9 @@ where
 struct WindowAttributes {
     accepts_input: bool,
     has_take_focus: bool,
-    role: WindowRole,
+    is_menu: bool,
     override_redirect: bool,
+    role: WindowRole,
     dims: WindowDims,
     size_hints: Option<WmNormalHints>,
     title: Option<WmName>,
@@ -112,6 +113,8 @@ struct WindowAttributes {
     group: Option<x::Window>,
     decorations: Option<Decorations>,
     transient_for: Option<x::Window>,
+    fullscreen: bool,
+    maximized: bool,
 }
 
 impl WindowAttributes {
@@ -139,8 +142,8 @@ impl WindowData {
         Self {
             mapped: false,
             attrs: WindowAttributes {
-                role: WindowRole::new_basic(override_redirect),
                 override_redirect,
+                role: WindowRole::new_basic(override_redirect),
                 dims,
                 ..Default::default()
             },
@@ -242,6 +245,7 @@ struct ToplevelData {
     toplevel: XdgToplevel,
     xdg: XdgSurfaceData,
     fullscreen: bool,
+    maximized: bool,
     decoration: decoration::DecorationsData,
 }
 
@@ -250,6 +254,7 @@ struct PopupData {
     popup: XdgPopup,
     positioner: XdgPositioner,
     xdg: XdgSurfaceData,
+    parent: x::Window,
 }
 
 trait Event {
@@ -440,6 +445,9 @@ impl<S: X11Selection> XConnection for NoConnection<S> {
     }
     fn set_fullscreen(&mut self, _: x::Window, _: bool) {
         debug!("could not toggle fullscreen without XWayland initialized");
+    }
+    fn set_maximized(&mut self, _: x::Window, _: bool) {
+        debug!("could not toggle maximized without XWayland initialized");
     }
     fn set_window_dims(&mut self, _: x::Window, _: crate::server::PendingSurfaceState) -> bool {
         debug!("could not set window dimensions without XWayland initialized");
@@ -717,13 +725,18 @@ impl<C: XConnection> ServerState<C> {
                     "focusing (take_focus={has_take_focus:?}) {} {window:?}",
                     if is_popup { "popup" } else { "window" }
                 );
-                if has_take_focus {
-                    self.connection.send_take_focus(window);
+                if is_popup {
+                    if has_take_focus {
+                        self.connection.send_take_focus(window);
+                    } else {
+                        self.connection.focus_window(window, output_name);
+                    }
                 } else {
                     self.connection.focus_window(window, output_name);
-                    if !is_popup {
-                        self.last_focused_toplevel = Some(window);
+                    if has_take_focus {
+                        self.connection.send_take_focus(window);
                     }
+                    self.last_focused_toplevel = Some(window);
                 }
             } else if self.unfocus {
                 self.connection.focus_window(x::WINDOW_NONE, None);
@@ -1066,13 +1079,12 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
         for (entity, name) in query.iter() {
             if *name == global {
                 self.updated_outputs.push(*entity);
-                self.world
+                let _ = self.world
                     .remove::<(
                         OutputScaleFactor,
                         event::TrueOutputScaleFactor,
                         OutputDimensions,
-                    )>(*entity)
-                    .unwrap();
+                    )>(*entity);
                 let _ = self.world.remove_one::<event::X11OutputPosition>(*entity);
 
                 let mut surfaces_to_update = Vec::new();
@@ -1295,6 +1307,25 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
         attrs.has_take_focus = has_take_focus;
     }
 
+    pub(crate) fn set_win_is_menu(&mut self, window: x::Window, is_menu: bool) {
+        let Some(id) = self.windows.get(&window).copied() else {
+            return;
+        };
+
+        let attrs = &mut self.world.get::<&mut WindowData>(id).unwrap().attrs;
+        attrs.is_menu = is_menu;
+    }
+
+    pub(crate) fn is_override_redirect(&self, window: x::Window) -> bool {
+        let Some(id) = self.windows.get(&window).copied() else {
+            return false;
+        };
+        let Ok(data) = self.world.get::<&WindowData>(id) else {
+            return false;
+        };
+        data.attrs.override_redirect
+    }
+
     pub(crate) fn set_size_hints(&mut self, window: x::Window, hints: WmNormalHints) {
         let Some(data) = self
             .windows
@@ -1341,6 +1372,22 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
                 }
             }
             win.attrs.decorations = Some(decorations);
+        }
+    }
+
+    pub(crate) fn set_win_maximized(&mut self, window: x::Window, maximized: bool) {
+        if let Some(id) = self.windows.get(&window).copied() {
+            if let Ok(mut win) = self.world.get::<&mut WindowData>(id) {
+                win.attrs.maximized = maximized;
+            }
+        }
+    }
+
+    pub(crate) fn set_win_fullscreen(&mut self, window: x::Window, fullscreen: bool) {
+        if let Some(id) = self.windows.get(&window).copied() {
+            if let Ok(mut win) = self.world.get::<&mut WindowData>(id) {
+                win.attrs.fullscreen = fullscreen;
+            }
         }
     }
 
@@ -1414,7 +1461,8 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
             SurfaceRole::Popup(Some(popup)) => {
                 let mut parent_dims = WindowDims::default();
                 let mut decorations_height = 0;
-                if let Some(parent) = transient_for {
+                let parent = transient_for.or(Some(popup.parent));
+                if let Some(parent) = parent {
                     if let Some(&parent_entity) = self.windows.get(&parent) {
                         if let Ok(parent_data) = self.world.get::<&WindowData>(parent_entity) {
                             parent_dims = parent_data.attrs.dims;
@@ -1430,16 +1478,21 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
                 }
                 let rx = event.x() as i32 - parent_dims.x as i32;
                 let ry = event.y() as i32 - parent_dims.y as i32;
-                let mut ry_scaled = (ry as f64 / scale_factor.0) as i32;
+                let mut ry_scaled = (ry as f64 / scale_factor.0).round() as i32;
                 ry_scaled -= decorations_height;
-                popup
-                    .positioner
-                    .set_offset((rx as f64 / scale_factor.0) as i32, ry_scaled);
+                let rx_scaled = (rx as f64 / scale_factor.0).round() as i32;
+                popup.positioner.set_offset(rx_scaled, ry_scaled);
                 popup.positioner.set_size(
                     1.max((event.width() as f64 / scale_factor.0).ceil() as i32),
                     1.max((event.height() as f64 / scale_factor.0).ceil() as i32),
                 );
                 popup.popup.reposition(&popup.positioner, 0);
+
+                drop(query);
+                let mut win = data.get::<&mut WindowData>().unwrap();
+                win.attrs.dims = dims;
+                drop(win);
+                update_surface_viewport(&self.world, self.world.query_one(data.entity()).unwrap());
             }
             SurfaceRole::Toplevel(Some(_)) => {
                 drop(query);
@@ -1516,14 +1569,26 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
         };
 
         let Some(role) = data.get::<&SurfaceRole>() else {
-            warn!("Tried to set window without role fullscreen: {window:?}");
+            if let Some(mut win) = data.get::<&mut WindowData>() {
+                win.attrs.fullscreen = state.apply(win.attrs.fullscreen);
+            } else {
+                warn!("Tried to set window without role fullscreen: {window:?}");
+            }
             return;
         };
 
         let SurfaceRole::Toplevel(Some(toplevel)) = &*role else {
-            warn!("Tried to set an unmapped toplevel or non toplevel fullscreen: {window:?}");
+            if let Some(mut win) = data.get::<&mut WindowData>() {
+                win.attrs.fullscreen = state.apply(win.attrs.fullscreen);
+            } else {
+                warn!("Tried to set an unmapped toplevel or non toplevel fullscreen: {window:?}");
+            }
             return;
         };
+
+        if let Some(mut win) = data.get::<&mut WindowData>() {
+            win.attrs.fullscreen = state.apply(win.attrs.fullscreen);
+        }
 
         use crate::xstate::SetState;
         match state {
@@ -1534,6 +1599,53 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
                     toplevel.toplevel.unset_fullscreen()
                 } else {
                     toplevel.toplevel.set_fullscreen(None)
+                }
+            }
+        }
+    }
+
+    pub(crate) fn set_maximized(&mut self, window: x::Window, state: super::xstate::SetState) {
+        let Some(data) = self
+            .windows
+            .get(&window)
+            .copied()
+            .and_then(|id| self.world.entity(id).ok())
+        else {
+            warn!("Tried to set unknown window {window:?} maximized");
+            return;
+        };
+
+        let Some(role) = data.get::<&SurfaceRole>() else {
+            if let Some(mut win) = data.get::<&mut WindowData>() {
+                win.attrs.maximized = state.apply(win.attrs.maximized);
+            } else {
+                warn!("Tried to set window without role maximized: {window:?}");
+            }
+            return;
+        };
+
+        let SurfaceRole::Toplevel(Some(toplevel)) = &*role else {
+            if let Some(mut win) = data.get::<&mut WindowData>() {
+                win.attrs.maximized = state.apply(win.attrs.maximized);
+            } else {
+                warn!("Tried to set an unmapped toplevel or non toplevel maximized: {window:?}");
+            }
+            return;
+        };
+
+        if let Some(mut win) = data.get::<&mut WindowData>() {
+            win.attrs.maximized = state.apply(win.attrs.maximized);
+        }
+
+        use crate::xstate::SetState;
+        match state {
+            SetState::Add => toplevel.toplevel.set_maximized(),
+            SetState::Remove => toplevel.toplevel.unset_maximized(),
+            SetState::Toggle => {
+                if toplevel.maximized {
+                    toplevel.toplevel.unset_maximized()
+                } else {
+                    toplevel.toplevel.set_maximized()
                 }
             }
         }
@@ -1721,6 +1833,7 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
         let xdg_surface;
         let mut popup_for = None;
         let mut fullscreen = false;
+        let maximized;
         let splash;
 
         {
@@ -1745,13 +1858,18 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
                     break;
                 }
             }
+            if window_data.attrs.fullscreen {
+                fullscreen = true;
+                popup_for = None;
+            }
+            maximized = window_data.attrs.maximized;
         }
 
         let (role, is_toplevel) = if let Some(parent) = popup_for {
             let data = self.create_popup(entity, xdg_surface, parent);
             (SurfaceRole::Popup(Some(data)), false)
         } else {
-            let data = self.create_toplevel(entity, xdg_surface, fullscreen, splash);
+            let data = self.create_toplevel(entity, xdg_surface, fullscreen, maximized, splash);
             (SurfaceRole::Toplevel(Some(data)), true)
         };
 
@@ -1780,11 +1898,12 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
         entity: Entity,
         xdg: XdgSurface,
         fullscreen: bool,
+        maximized: bool,
         splash: bool,
     ) -> ToplevelData {
         let window = self.world.get::<&WindowData>(entity).unwrap();
         debug!(
-            "creating toplevel for {:?} fullscreen: {fullscreen:?}",
+            "creating toplevel for {:?} fullscreen: {fullscreen:?} maximized: {maximized:?}",
             *self.world.get::<&x::Window>(entity).unwrap()
         );
 
@@ -1830,6 +1949,8 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
 
         if fullscreen {
             toplevel.set_fullscreen(None);
+        } else if maximized {
+            toplevel.set_maximized();
         }
 
         let wl_decoration = self.decoration_manager.as_ref().map(|decoration_manager| {
@@ -1908,6 +2029,7 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
             },
             toplevel,
             fullscreen: false,
+            maximized,
             decoration: DecorationsData {
                 wl: wl_decoration,
                 satellite: sat_decoration,
@@ -1969,8 +2091,8 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
             1.max((window_dims.width as f64 / initial_scale).ceil() as i32),
             1.max((window_dims.height as f64 / initial_scale).ceil() as i32),
         );
-        let x = ((window_dims.x - parent_dims.x) as f64 / initial_scale) as i32;
-        let mut y = ((window_dims.y - parent_dims.y) as f64 / initial_scale) as i32;
+        let x = ((window_dims.x - parent_dims.x) as f64 / initial_scale).round() as i32;
+        let mut y = ((window_dims.y - parent_dims.y) as f64 / initial_scale).round() as i32;
         y -= decorations_height;
         positioner.set_offset(x, y);
         positioner.set_anchor(Anchor::TopLeft);
@@ -1993,6 +2115,7 @@ impl<S: X11Selection + 'static> InnerServerState<S> {
                 configured: false,
                 pending: None,
             },
+            parent,
         }
     }
 }

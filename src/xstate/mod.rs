@@ -290,10 +290,13 @@ impl XState {
             self.atoms.supported,
             x::ATOM_ATOM,
             &[
+                self.atoms.wm_check,
                 self.atoms.active_win,
                 self.atoms.motif_wm_hints,
                 self.atoms.net_wm_state,
                 self.atoms.wm_fullscreen,
+                self.atoms.wm_maximized_vert,
+                self.atoms.wm_maximized_horz,
                 self.atoms.moveresize,
             ],
         );
@@ -313,7 +316,7 @@ impl XState {
                 mode: x::PropMode::Replace,
                 window: self.wm_window,
                 property: self.atoms.net_wm_name,
-                r#type: x::ATOM_STRING,
+                r#type: self.atoms.utf8_string,
                 data: b"xwayland-satellite",
             })
             .unwrap();
@@ -418,15 +421,17 @@ impl XState {
                         self.handle_window_properties(server_state, e.window())
                     );
                     server_state.map_window(e.window());
-                    unwrap_or_skip_bad_window_cont!(self.connection.send_and_check_request(
-                        &x::ChangeProperty {
-                            mode: x::PropMode::Replace,
-                            window: e.window(),
-                            property: self.atoms.wm_state,
-                            r#type: self.atoms.wm_state,
-                            data: &[WmState::Normal as u32, x::Window::none().resource_id()],
-                        }
-                    ));
+                    if !e.override_redirect() {
+                        unwrap_or_skip_bad_window_cont!(self.connection.send_and_check_request(
+                            &x::ChangeProperty {
+                                mode: x::PropMode::Replace,
+                                window: e.window(),
+                                property: self.atoms.wm_state,
+                                r#type: self.atoms.wm_state,
+                                data: &[WmState::Normal as u32, x::Window::none().resource_id()],
+                            }
+                        ));
+                    }
                 }
                 xcb::Event::X(x::Event::ConfigureNotify(e)) => {
                     server_state.reconfigure_window(e);
@@ -455,22 +460,24 @@ impl XState {
                         server_state.connection.focus_window(restore_to, None);
                     }
 
-                    unwrap_or_skip_bad_window_cont!(self.connection.send_and_check_request(
-                        &x::ChangeWindowAttributes {
-                            window: e.window(),
-                            value_list: &[x::Cw::EventMask(x::EventMask::empty())],
-                        }
-                    ));
+                    if !server_state.is_override_redirect(e.window()) {
+                        unwrap_or_skip_bad_window_cont!(self.connection.send_and_check_request(
+                            &x::ChangeWindowAttributes {
+                                window: e.window(),
+                                value_list: &[x::Cw::EventMask(x::EventMask::empty())],
+                            }
+                        ));
 
-                    unwrap_or_skip_bad_window_cont!(self.connection.send_and_check_request(
-                        &x::ChangeProperty {
-                            mode: x::PropMode::Replace,
-                            window: e.window(),
-                            property: self.atoms.wm_state,
-                            r#type: self.atoms.wm_state,
-                            data: &[WmState::Withdrawn as u32, x::Window::none().resource_id()],
-                        }
-                    ));
+                        unwrap_or_skip_bad_window_cont!(self.connection.send_and_check_request(
+                            &x::ChangeProperty {
+                                mode: x::PropMode::Replace,
+                                window: e.window(),
+                                property: self.atoms.wm_state,
+                                r#type: self.atoms.wm_state,
+                                data: &[WmState::Withdrawn as u32, x::Window::none().resource_id()],
+                            }
+                        ));
+                    }
                 }
                 xcb::Event::X(x::Event::DestroyNotify(e)) => {
                     debug!("destroying window {:?}", e.window());
@@ -543,13 +550,15 @@ impl XState {
             }
             x if x == self.atoms.wl_surface_serial => {
                 let x::ClientMessageData::Data32(data) = e.data() else {
-                    unreachable!();
+                    warn!("Invalid data format for WL_SURFACE_SERIAL client message");
+                    return;
                 };
                 server_state.set_window_serial(e.window(), [data[0], data[1]]);
             }
             x if x == self.atoms.net_wm_state => {
                 let x::ClientMessageData::Data32(data) = e.data() else {
-                    unreachable!();
+                    warn!("Invalid data format for _NET_WM_STATE client message");
+                    return;
                 };
                 let Ok(action) = SetState::try_from(data[0]) else {
                     warn!("unknown action for _NET_WM_STATE: {}", data[0]);
@@ -560,21 +569,26 @@ impl XState {
 
                 trace!("_NET_WM_STATE ({action:?}) props: {prop1:?} {prop2:?}");
 
-                for prop in [prop1, prop2] {
-                    match prop {
-                        x if x == self.atoms.wm_fullscreen => {
-                            server_state.set_fullscreen(e.window(), action);
-                        }
-                        _ => {}
-                    }
+                let is_maximized = |atom: x::Atom| {
+                    atom == self.atoms.wm_maximized_vert || atom == self.atoms.wm_maximized_horz
+                };
+                if is_maximized(prop1) || is_maximized(prop2) {
+                    server_state.set_maximized(e.window(), action);
+                }
+                if prop1 == self.atoms.wm_fullscreen || prop2 == self.atoms.wm_fullscreen {
+                    server_state.set_fullscreen(e.window(), action);
                 }
             }
             x if x == self.atoms.active_win => {
-                server_state.activate_window(e.window());
+                let win = e.window();
+                if win != self.root && win != x::WINDOW_NONE {
+                    server_state.activate_window(win);
+                }
             }
             x if x == self.atoms.moveresize => {
                 let x::ClientMessageData::Data32(data) = e.data() else {
-                    unreachable!();
+                    warn!("Invalid data format for _NET_WM_MOVERESIZE client message");
+                    return;
                 };
 
                 let (_x_root, _y_root) = (data[0], data[1]);
@@ -661,6 +675,17 @@ impl XState {
             server_state.set_win_hints(window, hints);
         }
 
+        if let Ok(Some(states)) = self.get_net_wm_state(window) {
+            if states.contains(&self.atoms.wm_maximized_vert)
+                || states.contains(&self.atoms.wm_maximized_horz)
+            {
+                server_state.set_win_maximized(window, true);
+            }
+            if states.contains(&self.atoms.wm_fullscreen) {
+                server_state.set_win_fullscreen(window, true);
+            }
+        }
+
         let transient_for = self.get_transient_for(window)?;
         let override_redirect = self.get_override_redirect(window)?;
         server_state.set_override_redirect(window, override_redirect);
@@ -668,6 +693,15 @@ impl XState {
         let window_types = self
             .get_net_wm_window_types(window)?
             .unwrap_or_else(Vec::new);
+
+        let is_menu = window_types.iter().any(|&atom| {
+            atom == self.window_atoms.dropdown_menu
+                || atom == self.window_atoms.popup_menu
+                || atom == self.window_atoms.menu
+                || atom == self.window_atoms.tooltip
+                || atom == self.window_atoms.combo
+        });
+        server_state.set_win_is_menu(window, is_menu);
 
         let heuristics = WindowRoleHeuristics {
             override_redirect,
@@ -765,6 +799,12 @@ impl XState {
 
     fn get_protocols(&self, window: x::Window) -> XResult<Option<Vec<x::Atom>>> {
         let cookie = self.get_property_cookie(window, self.atoms.wm_protocols, x::ATOM_ATOM, 10);
+        let resolver = |reply: x::GetPropertyReply| reply.value::<x::Atom>().to_vec();
+        PropertyCookieWrapper::new(&self.connection, cookie).resolve(resolver)
+    }
+
+    fn get_net_wm_state(&self, window: x::Window) -> XResult<Option<Vec<x::Atom>>> {
+        let cookie = self.get_property_cookie(window, self.atoms.net_wm_state, x::ATOM_ATOM, 1024);
         let resolver = |reply: x::GetPropertyReply| reply.value::<x::Atom>().to_vec();
         PropertyCookieWrapper::new(&self.connection, cookie).resolve(resolver)
     }
@@ -884,6 +924,15 @@ impl XState {
                     server_state.set_win_decorations(window, decorations);
                 }
             }
+            x if x == self.atoms.net_wm_state => {
+                if let Ok(Some(states)) = self.get_net_wm_state(window) {
+                    let maximized = states.contains(&self.atoms.wm_maximized_vert)
+                        || states.contains(&self.atoms.wm_maximized_horz);
+                    let fullscreen = states.contains(&self.atoms.wm_fullscreen);
+                    server_state.set_win_maximized(window, maximized);
+                    server_state.set_win_fullscreen(window, fullscreen);
+                }
+            }
             _ => {
                 if log::log_enabled!(log::Level::Debug) {
                     debug!(
@@ -914,6 +963,8 @@ xcb::atoms_struct! {
         wm_pid => b"_NET_WM_PID" only_if_exists = false,
         net_wm_state => b"_NET_WM_STATE" only_if_exists = false,
         wm_fullscreen => b"_NET_WM_STATE_FULLSCREEN" only_if_exists = false,
+        wm_maximized_vert => b"_NET_WM_STATE_MAXIMIZED_VERT" only_if_exists = false,
+        wm_maximized_horz => b"_NET_WM_STATE_MAXIMIZED_HORZ" only_if_exists = false,
         active_win => b"_NET_ACTIVE_WINDOW" only_if_exists = false,
         client_list => b"_NET_CLIENT_LIST" only_if_exists = false,
         supported => b"_NET_SUPPORTED" only_if_exists = false,
@@ -1204,6 +1255,13 @@ impl WindowRoleHeuristics {
             match ty {
                 x if x == window_atoms.normal => return WindowRole::Toplevel,
                 x if x == window_atoms.dialog => {
+                    let is_steam = self
+                        .wm_class
+                        .as_deref()
+                        .is_some_and(|c| c == "steam" || c == "steamwebhelper");
+                    if is_steam {
+                        return WindowRole::Toplevel;
+                    }
                     return WindowRole::new_basic(
                         self.has_transient_for && motif_no_decor && forced_size,
                     );
@@ -1256,6 +1314,16 @@ pub enum SetState {
     Remove,
     Add,
     Toggle,
+}
+
+impl SetState {
+    pub(crate) fn apply(self, current: bool) -> bool {
+        match self {
+            Self::Remove => false,
+            Self::Add => true,
+            Self::Toggle => !current,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, num_enum::TryFromPrimitive)]
@@ -1343,6 +1411,57 @@ impl RealConnection {
     fn root_window(&self) -> x::Window {
         self.connection.get_setup().roots().next().unwrap().root()
     }
+
+    fn get_net_wm_state(&self, window: x::Window) -> XResult<Option<Vec<x::Atom>>> {
+        let cookie = self.connection.send_request(&x::GetProperty {
+            delete: false,
+            window,
+            property: self.atoms.net_wm_state,
+            r#type: x::ATOM_ATOM,
+            long_offset: 0,
+            long_length: 1024,
+        });
+        let reply = self.connection.wait_for_reply(cookie)?;
+        Ok(Some(reply.value::<x::Atom>().to_vec()))
+    }
+
+    fn update_net_wm_state(&mut self, window: x::Window, add: &[x::Atom], remove: &[x::Atom]) {
+        let current_state = self
+            .get_net_wm_state(window)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let mut new_state: Vec<x::Atom> = current_state
+            .into_iter()
+            .filter(|atom| !remove.contains(atom))
+            .collect();
+        for atom in add {
+            if !new_state.contains(atom) {
+                new_state.push(*atom);
+            }
+        }
+        if let Err(e) = self
+            .connection
+            .send_and_check_request(&x::ChangeProperty::<x::Atom> {
+                mode: x::PropMode::Replace,
+                window,
+                property: self.atoms.net_wm_state,
+                r#type: x::ATOM_ATOM,
+                data: &new_state,
+            })
+        {
+            warn!("Failed to update _NET_WM_STATE on {window:?} ({e})");
+        }
+    }
+    fn is_override_redirect(&self, window: x::Window) -> bool {
+        self.connection
+            .wait_for_reply(
+                self.connection
+                    .send_request(&x::GetWindowAttributes { window }),
+            )
+            .map(|w| w.override_redirect())
+            .unwrap_or(false)
+    }
 }
 
 impl XConnection for RealConnection {
@@ -1369,23 +1488,19 @@ impl XConnection for RealConnection {
     }
 
     fn set_fullscreen(&mut self, window: x::Window, fullscreen: bool) {
-        let data = if fullscreen {
-            std::slice::from_ref(&self.atoms.wm_fullscreen)
+        if fullscreen {
+            self.update_net_wm_state(window, &[self.atoms.wm_fullscreen], &[]);
         } else {
-            &[]
-        };
+            self.update_net_wm_state(window, &[], &[self.atoms.wm_fullscreen]);
+        }
+    }
 
-        if let Err(e) = self
-            .connection
-            .send_and_check_request(&x::ChangeProperty::<x::Atom> {
-                mode: x::PropMode::Replace,
-                window,
-                property: self.atoms.net_wm_state,
-                r#type: x::ATOM_ATOM,
-                data,
-            })
-        {
-            warn!("Failed to set fullscreen state on {window:?} ({e})");
+    fn set_maximized(&mut self, window: x::Window, maximized: bool) {
+        let max_atoms = [self.atoms.wm_maximized_vert, self.atoms.wm_maximized_horz];
+        if maximized {
+            self.update_net_wm_state(window, &max_atoms, &[]);
+        } else {
+            self.update_net_wm_state(window, &[], &max_atoms);
         }
     }
 
@@ -1408,14 +1523,16 @@ impl XConnection for RealConnection {
         }) {
             debug!("ChangeProperty failed ({window:?}: {e:?})");
         }
-        if let Err(e) = self.connection.send_and_check_request(&x::ChangeProperty {
-            mode: x::PropMode::Replace,
-            window,
-            property: self.atoms.wm_state,
-            r#type: self.atoms.wm_state,
-            data: &[WmState::Normal as u32, 0],
-        }) {
-            debug!("ChangeProperty failed ({window:?}: {e:?})");
+        if window != x::WINDOW_NONE && !self.is_override_redirect(window) {
+            if let Err(e) = self.connection.send_and_check_request(&x::ChangeProperty {
+                mode: x::PropMode::Replace,
+                window,
+                property: self.atoms.wm_state,
+                r#type: self.atoms.wm_state,
+                data: &[WmState::Normal as u32, 0],
+            }) {
+                debug!("ChangeProperty failed ({window:?}: {e:?})");
+            }
         }
 
         if let Some(name) = output_name {
@@ -1428,9 +1545,18 @@ impl XConnection for RealConnection {
                 return;
             }
 
+            let primary_window = if window != x::WINDOW_NONE {
+                window
+            } else {
+                self.root_window()
+            };
+
             if let Err(e) = self
                 .connection
-                .send_and_check_request(&xcb::randr::SetOutputPrimary { window, output })
+                .send_and_check_request(&xcb::randr::SetOutputPrimary {
+                    window: primary_window,
+                    output,
+                })
             {
                 warn!("Couldn't set output {name} as primary: {e:?}");
             } else {
