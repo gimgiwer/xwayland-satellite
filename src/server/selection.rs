@@ -16,7 +16,10 @@ use smithay_client_toolkit::primary_selection::device::PrimarySelectionDevice;
 use smithay_client_toolkit::primary_selection::offer::PrimarySelectionOffer;
 use smithay_client_toolkit::primary_selection::selection::PrimarySelectionSource;
 use std::io::Read;
+use std::os::fd::AsFd;
 use std::rc::{Rc, Weak};
+
+pub(crate) const MAX_CLIPBOARD_SIZE: usize = 16 * 1024 * 1024;
 
 pub(super) struct SelectionStates<S: X11Selection> {
     clipboard: Option<SelectionState<S, Clipboard>>,
@@ -24,7 +27,7 @@ pub(super) struct SelectionStates<S: X11Selection> {
 }
 
 impl<S: X11Selection> SelectionStates<S> {
-    pub fn new(global_list: &GlobalList, qh: &QueueHandle<MyWorld>) -> Self {
+    pub(super) fn new(global_list: &GlobalList, qh: &QueueHandle<MyWorld>) -> Self {
         Self {
             clipboard: DataDeviceManagerState::bind(global_list, qh)
                 .inspect_err(|e| {
@@ -39,7 +42,7 @@ impl<S: X11Selection> SelectionStates<S> {
         }
     }
 
-    pub fn seat_created(&mut self, qh: &QueueHandle<MyWorld>, seat: &WlSeat) {
+    pub(super) fn seat_created(&mut self, qh: &QueueHandle<MyWorld>, seat: &WlSeat) {
         if let Some(c) = &mut self.clipboard {
             c.device = Some(c.manager.get_data_device(qh, seat));
         }
@@ -146,28 +149,87 @@ impl<S: X11Selection> InnerServerState<S> {
     }
 }
 
-pub struct ForeignSelection<T: SelectionType> {
-    pub mime_types: Box<[String]>,
+pub(crate) struct ForeignSelection<T: SelectionType> {
+    pub(crate) mime_types: Box<[String]>,
     inner: T::Offer,
 }
 
 #[allow(private_bounds)]
 impl<T: SelectionType> ForeignSelection<T> {
+    pub(crate) fn receive_async(&self, mime_type: String) -> std::io::Result<ReadPipe> {
+        let pipe = T::receive_offer(&self.inner, mime_type)?;
+        rustix::fs::fcntl_setfl(&pipe, rustix::fs::OFlags::NONBLOCK)?;
+        Ok(pipe)
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn receive(
         &self,
         mime_type: String,
         state: &ServerState<impl XConnection>,
     ) -> Vec<u8> {
         let mut pipe = T::receive_offer(&self.inner, mime_type).unwrap();
+        if let Err(e) = rustix::fs::fcntl_setfl(&pipe, rustix::fs::OFlags::NONBLOCK) {
+            warn!("Failed to set non-blocking mode on clipboard pipe: {:?}", e);
+        }
         state.queue.flush().unwrap();
         let mut data = Vec::new();
-        pipe.read_to_end(&mut data).unwrap();
+        let expires_at = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let now = std::time::Instant::now();
+            if now >= expires_at {
+                warn!("Clipboard read timeout");
+                break;
+            }
+            let remaining = expires_at - now;
+            let timeout = rustix::event::Timespec {
+                tv_sec: remaining.as_secs() as i64,
+                tv_nsec: remaining.subsec_nanos() as i64,
+            };
+            let ready = {
+                let borrowed_fd = pipe.as_fd();
+                let poll_fd =
+                    rustix::event::PollFd::new(&borrowed_fd, rustix::event::PollFlags::IN);
+                let mut fds = [poll_fd];
+                rustix::event::poll(&mut fds, Some(&timeout))
+            };
+            match ready {
+                Ok(0) => {
+                    warn!("Clipboard read timeout");
+                    break;
+                }
+                Ok(_) => {
+                    let mut buf = [0u8; 4096];
+                    match pipe.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            data.extend_from_slice(&buf[..n]);
+                            if data.len() > MAX_CLIPBOARD_SIZE {
+                                warn!("Clipboard size exceeds 16MB limit, aborting transfer");
+                                return Vec::new();
+                            }
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(e) => {
+                            warn!("Clipboard read error: {e:?}");
+                            break;
+                        }
+                    }
+                }
+                Err(e) if e == rustix::io::Errno::INTR => continue,
+                Err(e) => {
+                    warn!("Clipboard poll error: {e:?}");
+                    break;
+                }
+            }
+        }
         data
     }
 }
 
 #[allow(private_bounds, private_interfaces)]
-pub trait SelectionType: Sized {
+pub(crate) trait SelectionType: Sized {
     type Source;
     type Offer;
     type Manager;
@@ -198,8 +260,8 @@ pub trait SelectionType: Sized {
     fn get_mimes(offer: &Self::Offer) -> Box<[String]>;
 }
 
-pub enum Clipboard {}
-pub enum Primary {}
+pub(crate) enum Clipboard {}
+pub(crate) enum Primary {}
 
 #[allow(private_bounds, private_interfaces)]
 impl SelectionType for Clipboard {

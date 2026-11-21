@@ -1234,7 +1234,11 @@ impl Dispatch<ZwpPrimarySelectionOfferV1, Vec<PasteData>> for State {
                     .position(|data| data.mime_type == mime_type)
                     .unwrap_or_else(|| panic!("Invalid mime type: {mime_type}"));
 
-                TransferFd::from(fd).write_all(&data[pos].data).unwrap();
+                match TransferFd::from(fd).write_all(&data[pos].data) {
+                    Ok(()) => {}
+                    Err(ref e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+                    Err(e) => panic!("Failed to write paste data: {e:?}"),
+                }
             }
             Request::Destroy => {}
             other => todo!("{other:?}"),
@@ -1318,7 +1322,11 @@ impl Dispatch<WlDataOffer, Vec<PasteData>> for State {
                     .position(|data| data.mime_type == mime_type)
                     .unwrap_or_else(|| panic!("Invalid mime type: {mime_type}"));
 
-                TransferFd::from(fd).write_all(&data[pos].data).unwrap();
+                match TransferFd::from(fd).write_all(&data[pos].data) {
+                    Ok(()) => {}
+                    Err(ref e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+                    Err(e) => panic!("Failed to write paste data: {e:?}"),
+                }
             }
             wl_data_offer::Request::Destroy => {}
             other => todo!("unhandled request: {other:?}"),

@@ -1340,7 +1340,8 @@ fn copy_from_wayland() {
         long_length: 10,
     });
     let targets: &[x::Atom] = reply.value();
-    assert_eq!(targets.len(), 2);
+    assert_eq!(targets.len(), 3);
+    assert!(targets.contains(&connection.atoms.targets));
 
     for testwl::PasteData { mime_type, data } in offer {
         let atom = connection
@@ -1439,7 +1440,8 @@ fn incr_copy_from_wayland() {
         long_length: 10,
     });
     let targets: &[x::Atom] = reply.value();
-    assert_eq!(targets.len(), 1);
+    assert_eq!(targets.len(), 2);
+    assert!(targets.contains(&connection.atoms.targets));
 
     let offer_data = offer.pop().unwrap();
     let (mime_type, data) = (offer_data.mime_type, offer_data.data);
@@ -2573,4 +2575,180 @@ fn client_init_resize() {
         "Got wrong resizing edge: {:?}",
         data.resizing
     );
+}
+
+#[test]
+fn oversized_clipboard_transfer() {
+    let mut f = Fixture::new();
+    let mut connection = Connection::new(&f.display);
+
+    let window = connection.new_window(connection.root, 0, 0, 20, 20, false);
+    connection.get_selection_owner_change_events(true, window);
+    f.map_as_toplevel(&mut connection, window);
+    let offer = vec![testwl::PasteData {
+        mime_type: "text/plain".into(),
+        data: vec![b"a"[0]; 17 * 1024 * 1024],
+    }];
+
+    f.testwl.create_data_offer(offer);
+    connection.await_selection_owner_change();
+    connection.verify_clipboard_owner(connection.wm_window);
+    connection.get_selection_owner_change_events(false, window);
+
+    let dest1_atom = connection
+        .get_reply(&x::InternAtom {
+            name: b"dest_oversized",
+            only_if_exists: false,
+        })
+        .atom();
+
+    let text_atom = connection
+        .get_reply(&x::InternAtom {
+            name: b"text/plain",
+            only_if_exists: false,
+        })
+        .atom();
+
+    connection
+        .send_and_check_request(&x::ConvertSelection {
+            requestor: window,
+            selection: connection.atoms.clipboard,
+            target: text_atom,
+            property: dest1_atom,
+            time: x::CURRENT_TIME,
+        })
+        .unwrap();
+
+    f.wait_and_dispatch();
+    let request = connection.await_selection_notify();
+    assert_eq!(request.requestor(), window);
+    assert_eq!(request.selection(), connection.atoms.clipboard);
+    assert_eq!(request.target(), text_atom);
+    assert_eq!(request.property(), x::ATOM_NONE);
+}
+
+#[test]
+fn superseded_clipboard_transfer() {
+    let mut f = Fixture::new();
+    let mut connection = Connection::new(&f.display);
+
+    let window = connection.new_window(connection.root, 0, 0, 20, 20, false);
+    connection.get_selection_owner_change_events(true, window);
+    f.map_as_toplevel(&mut connection, window);
+    let offer = vec![testwl::PasteData {
+        mime_type: "text/plain".into(),
+        data: b"superseded test payload".to_vec(),
+    }];
+
+    f.testwl.create_data_offer(offer);
+    connection.await_selection_owner_change();
+    connection.verify_clipboard_owner(connection.wm_window);
+    connection.get_selection_owner_change_events(false, window);
+
+    let dest1_atom = connection
+        .get_reply(&x::InternAtom {
+            name: b"dest_superseded",
+            only_if_exists: false,
+        })
+        .atom();
+
+    let text_atom = connection
+        .get_reply(&x::InternAtom {
+            name: b"text/plain",
+            only_if_exists: false,
+        })
+        .atom();
+
+    // Send first ConvertSelection
+    connection
+        .send_and_check_request(&x::ConvertSelection {
+            requestor: window,
+            selection: connection.atoms.clipboard,
+            target: text_atom,
+            property: dest1_atom,
+            time: x::CURRENT_TIME,
+        })
+        .unwrap();
+
+    // Immediately send second ConvertSelection for the same requestor, selection, and property
+    connection
+        .send_and_check_request(&x::ConvertSelection {
+            requestor: window,
+            selection: connection.atoms.clipboard,
+            target: text_atom,
+            property: dest1_atom,
+            time: x::CURRENT_TIME,
+        })
+        .unwrap();
+
+    f.wait_and_dispatch();
+
+    // The first request must receive SelectionNotify with ATOM_NONE (superseded per ICCCM)
+    let first = connection.await_selection_notify();
+    assert_eq!(first.requestor(), window);
+    assert_eq!(first.selection(), connection.atoms.clipboard);
+    assert_eq!(first.property(), x::ATOM_NONE);
+
+    // The second request succeeds and receives property dest1_atom
+    let second = connection.await_selection_notify();
+    assert_eq!(second.requestor(), window);
+    assert_eq!(second.selection(), connection.atoms.clipboard);
+    assert_eq!(second.property(), dest1_atom);
+}
+
+#[test]
+fn obsolete_client_property_none() {
+    let mut f = Fixture::new();
+    let mut connection = Connection::new(&f.display);
+
+    let window = connection.new_window(connection.root, 0, 0, 20, 20, false);
+    connection.get_selection_owner_change_events(true, window);
+    f.map_as_toplevel(&mut connection, window);
+    let offer = vec![testwl::PasteData {
+        mime_type: "text/plain".into(),
+        data: b"obsolete client data".to_vec(),
+    }];
+
+    f.testwl.create_data_offer(offer);
+    connection.await_selection_owner_change();
+    connection.verify_clipboard_owner(connection.wm_window);
+    connection.get_selection_owner_change_events(false, window);
+
+    let text_atom = connection
+        .get_reply(&x::InternAtom {
+            name: b"text/plain",
+            only_if_exists: false,
+        })
+        .atom();
+
+    // ConvertSelection with property ATOM_NONE per ICCCM §2.2
+    connection
+        .send_and_check_request(&x::ConvertSelection {
+            requestor: window,
+            selection: connection.atoms.clipboard,
+            target: text_atom,
+            property: x::ATOM_NONE,
+            time: x::CURRENT_TIME,
+        })
+        .unwrap();
+
+    f.wait_and_dispatch();
+    let request = connection.await_selection_notify();
+    assert_eq!(request.requestor(), window);
+    assert_eq!(request.selection(), connection.atoms.clipboard);
+    assert_eq!(request.target(), text_atom);
+    assert_eq!(request.property(), text_atom);
+
+    let val: Vec<u8> = connection
+        .get_reply(&x::GetProperty {
+            delete: true,
+            window,
+            property: text_atom,
+            r#type: x::ATOM_ANY,
+            long_offset: 0,
+            long_length: 10,
+        })
+        .value()
+        .to_vec();
+    assert_eq!(val, b"obsolete client data");
 }

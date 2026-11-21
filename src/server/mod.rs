@@ -332,7 +332,7 @@ macro_rules! impl_event {
 }
 
 impl_event! {
-enum ObjectEvent {
+pub(crate) enum ObjectEvent {
     Surface(event::SurfaceEvents),
     Buffer(client::wl_buffer::Event),
     Seat(client::wl_seat::Event),
@@ -467,7 +467,7 @@ pub struct InnerServerState<S: X11Selection> {
     pids: HashSet<u32>,
 
     world: MyWorld,
-    queue: EventQueue<MyWorld>,
+    pub(crate) queue: EventQueue<MyWorld>,
     qh: QueueHandle<MyWorld>,
     globals_map: HashMap<GlobalName, (Global, GlobalId)>,
     client: Client,

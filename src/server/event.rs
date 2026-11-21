@@ -1367,7 +1367,7 @@ impl OutputEvent {
                     .name(name.clone());
                 state.world.insert(target, (OutputName(name),)).unwrap();
             }
-            Event::Done {} => {
+            Event::Done => {
                 let Ok((output, xdg)) = state
                     .world
                     .query_one_mut::<(&WlOutput, Option<&XdgOutputServer>)>(target)

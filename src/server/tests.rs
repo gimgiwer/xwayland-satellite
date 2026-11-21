@@ -1645,6 +1645,70 @@ fn selection_x11_then_wayland<T: SelectionTest>() {
 }
 
 #[test]
+fn test_foreign_selection_receive_oversized_clamp() {
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    TestObject::<WlKeyboard>::from_request(&comp.seat.obj, wl_seat::Request::GetKeyboard {});
+    let win = Window::new(1);
+    let (_surface, _id) = f.create_toplevel(&comp, win);
+
+    let mimes = vec![testwl::PasteData {
+        mime_type: "text/large".to_string(),
+        data: vec![0x42; 17 * 1024 * 1024],
+    }];
+    Clipboard::create_offer(&mut f.testwl, mimes);
+    f.run();
+
+    let selection = f
+        .satellite
+        .new_selection::<super::selection::Clipboard>()
+        .expect("No new selection");
+
+    let received = std::thread::scope(|s| {
+        s.spawn(|| {
+            let pollfd = unsafe { BorrowedFd::borrow_raw(f.testwl.poll_fd().as_raw_fd()) };
+            let mut pollfd = [PollFd::from_borrowed_fd(pollfd, PollFlags::IN)];
+            let timeout = timespec_from_millis(100);
+            while poll(&mut pollfd, Some(&timeout)).unwrap() > 0 {
+                f.testwl.dispatch();
+            }
+        });
+        selection.receive("text/large".to_string(), &f.satellite)
+    });
+
+    assert!(received.is_empty(), "Oversized transfer must be clamped to empty payload");
+}
+
+#[test]
+fn test_foreign_selection_receive_timeout() {
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    TestObject::<WlKeyboard>::from_request(&comp.seat.obj, wl_seat::Request::GetKeyboard {});
+    let win = Window::new(1);
+    let (_surface, _id) = f.create_toplevel(&comp, win);
+
+    let mimes = vec![testwl::PasteData {
+        mime_type: "text/slow".to_string(),
+        data: b"never sent".to_vec(),
+    }];
+    Clipboard::create_offer(&mut f.testwl, mimes);
+    f.run();
+
+    let selection = f
+        .satellite
+        .new_selection::<super::selection::Clipboard>()
+        .expect("No new selection");
+
+    let start = std::time::Instant::now();
+    let received = selection.receive("text/slow".to_string(), &f.satellite);
+    let elapsed = start.elapsed();
+
+    assert!(received.is_empty(), "Timed out transfer must return empty payload");
+    assert!(
+        elapsed >= std::time::Duration::from_millis(1900),
+        "Must wait ~2s before timing out, took {elapsed:?}"
+    );
+}
+
+#[test]
 fn raise_window_on_pointer_event() {
     let (mut f, comp) = TestFixture::new_with_compositor();
     TestObject::<WlPointer>::from_request(&comp.seat.obj, wl_seat::Request::GetPointer {});

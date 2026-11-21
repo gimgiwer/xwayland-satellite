@@ -92,7 +92,7 @@ use wayland_server::protocol as server;
 use wl_drm::client::wl_drm::WlDrm;
 use xcb::x;
 
-pub(super) struct SelectionEvents<T> {
+pub(crate) struct SelectionEvents<T> {
     pub offer: Option<T>,
     pub requests: Vec<(
         String,
@@ -111,7 +111,7 @@ impl<T> Default for SelectionEvents<T> {
     }
 }
 
-pub(super) struct MyWorld {
+pub(crate) struct MyWorld {
     pub world: World,
     pub global_list: GlobalList,
     pub new_globals: Vec<Global>,
